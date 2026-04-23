@@ -1,0 +1,354 @@
+# Risk Agent — Workflow Engine Manifest
+# Platform: Diligent Agent Fabric / AWS Bedrock AgentCore
+# Framework: Claude Agent SDK
+# Schema: Agent Fabric YAML Manifest v1.0
+# Reference: Agent Fabric CARB Update (April 2026)
+
+name: risk-agent
+version: "1.0.0"
+description: >
+  Agentic ERM system covering risk identification, monitoring, breach response,
+  assessment lifecycle, and board reporting. Four specialist agents coordinated
+  by Risk Maestro orchestrator.
+
+runtime:
+  framework: claude-agent-sdk
+  model: claude-sonnet-4-20250514
+  region: us-east-1
+  execution_environment: bedrock-agentcore
+
+agent_fabric:
+  register_in_registry: true
+  use_llm_proxy: true
+  use_workflow_state_store: true
+  use_event_bus: true
+  use_command_center_ui: true
+  a2ui_schema_version: "1.0"
+
+---
+# STAGE 0: Pre-requisite Gate
+# Blocks all other stages until Configuration Agent confirms 5 pre-requisites
+stages:
+  - id: prereq_gate
+    name: Pre-requisite Setup
+    description: >
+      Configuration Agent guides Admin through initial setup. Blocks AI mode until
+      all 5 pre-requisites confirmed. Builds Configuration Profile.
+    agent:
+      prompt_file: .claude/agents/configuration-agent.md
+      skills:
+        - .claude/skills/erm-domain-context/SKILL.md
+        - .claude/skills/human-interaction/SKILL.md
+        - .claude/skills/notification-design/SKILL.md
+      tools:
+        - erm-mcp
+    trigger:
+      type: event
+      event: org_provisioned
+    guard_conditions:
+      - condition: configuration_profile_exists
+        on_fail: remain_in_stage
+    outputs:
+      - type: object
+        name: configuration_profile
+        schema:
+          $ref: "#/schemas/configuration_profile"
+    human_gates:
+      - gate_id: cfg.prereq_approve
+        type: approval_gate
+        target_role: admin_equivalent
+        required: true
+        on_approve: advance_to_next_stage
+        on_reject: remain_in_stage
+    transitions:
+      - to: risk_identification
+        condition: configuration_profile_exists AND all_prereqs_confirmed
+
+---
+  - id: risk_identification
+    name: Risk Identification
+    description: >
+      Operations Agent monitors external signals, assists with risk creation
+      across all three identification paths, and maintains library health.
+      Runs continuously after prereq gate clears.
+    agent:
+      prompt_file: .claude/agents/operations-agent.md
+      skills:
+        - .claude/skills/erm-domain-context/SKILL.md
+        - .claude/skills/risk-monitoring/SKILL.md
+        - .claude/skills/human-interaction/SKILL.md
+        - .claude/skills/notification-design/SKILL.md
+      tools:
+        - erm-mcp
+    trigger:
+      type: continuous
+      also_triggered_by:
+        - event: user_initiated_identification
+        - schedule: daily_library_health_scan
+    guard_conditions:
+      - condition: configuration_profile_loaded
+        on_fail: load_configuration_profile
+      - condition: mcp_server_reachable
+        on_fail: emit_sys001_and_standby
+    human_gates:
+      - gate_id: ops.risk_proposal
+        type: approval_gate
+        target_role: risk_owner_equivalent
+        on_approve: create_risk_record
+        on_modify: validate_and_create
+        on_reject: log_and_stop
+        revision_limit: 3
+        on_revision_limit_reached: escalate_to_admin_equivalent
+    outputs:
+      - type: notification
+        name: id_001_external_signal
+      - type: notification
+        name: id_030_library_health_digest
+    parallel_with: [monitoring, assessment_lifecycle]
+
+---
+  - id: monitoring
+    name: Continuous Monitoring
+    description: >
+      Operations Agent compares scores after every assessment completion using
+      the monitoring rule engine from the Configuration Profile. Fires breach
+      alerts when threshold is exceeded.
+    agent:
+      prompt_file: .claude/agents/operations-agent.md
+      skills:
+        - .claude/skills/risk-monitoring/SKILL.md
+        - .claude/skills/human-interaction/SKILL.md
+        - .claude/skills/notification-design/SKILL.md
+      tools:
+        - erm-mcp
+    trigger:
+      type: event
+      events:
+        - score_applied        # from Assessment Agent via Risk Maestro event bus
+        - control_score_applied # from Assessment Agent via Risk Maestro event bus
+        - human_score_override  # detected from AuditLog scan
+      also_triggered_by:
+        - schedule: daily_assessment_schedule_scan
+        - schedule: daily_stale_score_scan
+    guard_conditions:
+      - condition: risk_not_in_terminal_status
+        on_fail: skip_silently_log
+      - condition: risk_agent_managed_true
+        on_fail: skip_silently_log
+      - condition: risk_not_snoozed
+        on_fail: skip_silently_log
+      - condition: configuration_profile_loaded
+        on_fail: load_configuration_profile
+    human_gates:
+      - gate_id: ops.issue_plan
+        type: approval_gate
+        target_role: risk_owner_equivalent
+        on_approve: create_issue_and_assign
+        on_modify: validate_counter_check_and_create
+        on_reject: log_increment_revision
+        on_accept_risk: create_risk_acceptance_record
+        on_snooze: execute_snooze_protocol
+        revision_limit: 3
+        on_revision_limit_reached: escalate_to_admin_equivalent
+      - gate_id: ops.existing_issue_action
+        type: approval_gate
+        target_role: risk_owner_equivalent
+        on_approve: create_action_item
+      - gate_id: ops.reassessment
+        type: approval_gate
+        target_role: risk_owner_equivalent
+        on_approve: emit_reassessment_requested_event
+      - gate_id: ops.ctrl6_card
+        type: approval_gate
+        target_role: risk_owner_equivalent
+        on_approve: emit_reassessment_requested_event
+        on_accept_risk: create_risk_acceptance_record
+    event_outputs:
+      - event: reassessment_requested
+        target: risk_maestro
+        condition: ops.reassessment_approved OR ops.ctrl6_card_approved
+      - event: ctrl6_chain_triggered
+        target: risk_maestro
+        condition: ctrl6_failure_detected
+    parallel_with: [risk_identification, assessment_lifecycle]
+
+---
+  - id: assessment_lifecycle
+    name: Assessment Lifecycle
+    description: >
+      Assessment Agent manages the full assessment cycle for risks and controls —
+      prioritisation, assessor assignment, SLA monitoring, outlier detection,
+      aggregation, score application, and handoff to monitoring.
+    agent:
+      prompt_file: .claude/agents/assessment-agent.md
+      skills:
+        - .claude/skills/erm-domain-context/SKILL.md
+        - .claude/skills/risk-monitoring/SKILL.md
+        - .claude/skills/human-interaction/SKILL.md
+        - .claude/skills/notification-design/SKILL.md
+      tools:
+        - erm-mcp
+    trigger:
+      type: event
+      events:
+        - reassessment_requested  # from Operations Agent via Risk Maestro
+        - user_initiated_assessment
+      also_triggered_by:
+        - schedule: daily_stale_score_scan
+        - schedule: scheduled_control_assessment_interval
+    guard_conditions:
+      - condition: configuration_profile_loaded
+        on_fail: load_configuration_profile
+      - condition: mcp_server_reachable
+        on_fail: emit_sys001_and_standby
+      - condition: not_breach_priority_locked
+        on_fail: pause_and_await_lock_release
+    human_gates:
+      - gate_id: ass.queue_confirm
+        type: approval_gate
+        target_role: risk_owner_equivalent
+        on_confirm: proceed_to_assessor_assignment
+        on_reorder: apply_reorder_and_reconfirm
+      - gate_id: ass.assessors_conf
+        type: approval_gate
+        target_role: risk_owner_equivalent
+        on_confirm: dispatch_assessment_requests
+        on_swap: check_conflicts_and_reconfirm
+      - gate_id: ass.reassign
+        type: approval_gate
+        target_role: risk_owner_equivalent
+        on_reassign: update_assessor_and_notify
+        on_extend_deadline: update_deadline
+      - gate_id: ass.aggregation
+        type: approval_gate
+        target_role: risk_owner_equivalent
+        on_run_aggregation: execute_and_present_result
+    sla_monitoring:
+      check_interval_minutes: 360  # every 6 hours
+      thresholds:
+        fifty_pct: notify_assessors
+        seventy_five_pct: notify_assessors_and_owner
+        one_hundred_pct: alert_owner_and_propose_reassignment
+    event_outputs:
+      - event: score_applied
+        target: risk_maestro
+        condition: scores_valid_and_written
+      - event: control_score_applied
+        target: risk_maestro
+        condition: control_scores_valid_and_written
+    parallel_with: [monitoring, risk_identification]
+
+---
+  - id: reporting
+    name: Risk Reporting
+    description: >
+      Reporting Agent runs completeness checks, chases Risk Owners for missing data,
+      generates board report drafts, and publishes approved reports to Activity Centre
+      and AI Reporting.
+    agent:
+      prompt_file: .claude/agents/reporting-agent.md
+      skills:
+        - .claude/skills/erm-domain-context/SKILL.md
+        - .claude/skills/human-interaction/SKILL.md
+        - .claude/skills/notification-design/SKILL.md
+      tools:
+        - erm-mcp
+    trigger:
+      type: schedule
+      schedule: reporting_deadline_minus_7_days
+      also_triggered_by:
+        - event: admin_manual_report_trigger
+        - condition: completeness_threshold_reached
+    guard_conditions:
+      - condition: configuration_profile_loaded
+        on_fail: load_configuration_profile
+      - condition: mcp_server_reachable
+        on_fail: emit_sys001_and_standby
+    human_gates:
+      - gate_id: rep.report_approve
+        type: approval_gate
+        target_role: admin_equivalent
+        on_approve: publish_to_destinations
+        on_request_changes: apply_changes_and_resubmit
+        on_reject: log_do_not_publish
+        revision_limit: 3
+        on_revision_limit_reached: escalate_to_admin_equivalent
+    sla_monitoring:
+      report_approval_deadline_days: 5
+      on_overdue: escalate_to_admin_with_urgency
+
+---
+# SHARED: Risk Maestro Event Bus Subscriptions
+event_bus:
+  subscriptions:
+    - event: score_applied
+      from: assessment_lifecycle
+      to: monitoring
+    - event: control_score_applied
+      from: assessment_lifecycle
+      to: monitoring
+    - event: reassessment_requested
+      from: monitoring
+      to: assessment_lifecycle
+    - event: ctrl6_chain_triggered
+      from: monitoring
+      to: monitoring  # self-directed for audit
+    - event: reporting_summary_request
+      from: reporting
+      to: [monitoring, assessment_lifecycle]
+    - event: reporting_summary_response
+      from: risk_maestro
+      to: reporting
+    - event: breach_priority_lock
+      from: risk_maestro
+      to: assessment_lifecycle
+    - event: breach_priority_lock_released
+      from: risk_maestro
+      to: assessment_lifecycle
+    - event: configuration_changed
+      from: prereq_gate
+      to: [monitoring, assessment_lifecycle, reporting]
+
+---
+# SHARED: Operational Safety
+operational_safety:
+  agent_loop_max_iterations: 50
+  tool_call_rate_limit_per_minute: 30
+  cost_ceiling_usd_per_session: 5.00
+  error_cascade_breaker:
+    max_consecutive_failures: 3
+    action_on_breach: pause_and_alert_admin
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 5
+    reset_timeout_seconds: 300
+
+---
+# SHARED: Memory Configuration
+memory:
+  short_term:
+    type: agent_sdk_context
+    scope: session
+  long_term:
+    type: bedrock_agentcore_memory
+    scope: org_scoped
+    includes:
+      - configuration_profile
+      - agent_trust_scores
+      - rejection_learning_patterns
+      - risk_acceptance_records
+
+---
+# SCHEMAS
+schemas:
+  configuration_profile:
+    type: object
+    description: Customer-specific configuration mapping for all agents
+    required:
+      - profile_id
+      - org_id
+      - schema_version
+      - role_mapping
+      - workflow_status_mapping
+      - field_mapping
+      - monitoring_rule
